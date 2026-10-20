@@ -1,27 +1,19 @@
-#syntax=docker/dockerfile:1.4
-FROM python:3.12-alpine
+FROM python:3.11-slim
 
-# Use Aliyun pip mirror for China
-RUN pip install --no-cache-dir --quiet \
-    --index-url https://pypi.tuna.tsinghua.edu.cn/simple \
-    aiohttp pyyaml
+# Install system tools agents need
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    curl wget openssh-client git ca-certificates \
+    iproute2 dnsutils net-tools procps vim-tiny \
+    && rm -rf /var/lib/apt/lists/*
 
+# Copy app
+COPY app.py /app/app.py
 WORKDIR /app
-COPY app.py config.yaml /app/
-COPY requirements.txt /app/requirements.txt
-COPY entrypoint.sh /app/entrypoint.sh
-COPY scripts/ /app/scripts/
 
-RUN chmod +x /app/entrypoint.sh /app/scripts/*.sh && \
-    mkdir -p /var/log/agent-node && \
-    apk add --no-cache curl iproute2 openssh bash
+# Install Python deps
+RUN pip install --no-cache-dir gradio>=4.0.0
 
-# ModelScope Studio requires port 7860
-ENV PORT=7860
-ENV HOST=0.0.0.0
-ENV PYTHONUNBUFFERED=1
-ENV BOOTSTRAP_ENABLED=true
-
-EXPOSE 7860
-
-CMD ["python3", "/app/app.py"]
+# Run
+ENV HOST=0.0.0.0 PORT=7860
+CMD ["python", "app.py"]
