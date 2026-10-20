@@ -67,7 +67,7 @@ def _auto_install_tools():
 
 threading.Thread(target=_auto_install_tools, daemon=True).start()
 
-from aiohttp import web, WSMsgType, hdrs
+from aiohttp import web, WSMsgType
 from aiohttp.web import Response
 
 # ─── Config ───────────────────────────────────────────────────────────────
@@ -481,9 +481,9 @@ async def middleware(request, handler):
     try:
         response = await handler(request)
         response.headers["X-Request-ID"] = request_id
-        response.headers[hdrs.CORS_ALLOW_ORIGIN] = "*"
-        response.headers[hdrs.CORS_ALLOW_HEADERS] = "*"
-        response.headers[hdrs.CORS_ALLOW_METHODS] = "GET,POST,OPTIONS"
+        response.headers["Access-Control-Allow-Origin"] = "*"
+        response.headers["Access-Control-Allow-Headers"] = "*"
+        response.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
         return response
     except Exception as e:
         log.error(f"Request failed: {e}", extra={"request_id": request_id})
@@ -688,6 +688,19 @@ async def token_discovery(request):
 token_discovery = require_auth(token_discovery)
 
 
+def _safe_sysconf_mb(name):
+    """Get mem in MB from sysconf, handling missing names gracefully."""
+    try:
+        page_size = os.sysconf("SC_PAGE_SIZE")
+    except (ValueError, OSError):
+        page_size = 4096
+    try:
+        pages = os.sysconf(name)
+        return round(pages * page_size / 1024 / 1024, 1)
+    except (ValueError, OSError):
+        return None
+
+
 async def diagnostics(request):
     """System diagnostics (auth required)."""
     ssh_path = shutil.which("ssh")
@@ -696,8 +709,8 @@ async def diagnostics(request):
         "uptime": time.time() - START_TIME,
         "cpus": os.cpu_count(),
         "memory": {
-            "total": os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") if hasattr(os, 'sysconf') else "N/A",
-            "free": os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_AVPAGES") if hasattr(os, 'sysconf') else "N/A",
+            "total": _safe_sysconf_mb("SC_PHYS_PAGES") if hasattr(os, 'sysconf') else "N/A",
+            "free": _safe_sysconf_mb("SC_AVPAGES") if hasattr(os, 'sysconf') else "N/A",
             "pid": os.getpid()
         },
         "platform": detect_platform(),
