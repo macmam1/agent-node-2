@@ -1,14 +1,14 @@
 #!/bin/bash
 set -e
 
-# ─── agent-node v2.0 Entrypoint ───────────────────────────────────────
-echo "[entrypoint] agent-node v2.0 starting..."
+# ─── agent-node v2.1 Entrypoint ───────────────────────────────────────
+echo "[entrypoint] agent-node v2.1 starting..."
 
 # Ensure log directory exists
 mkdir -p /var/log/agent-node
 
-# Set defaults
-export PORT="${PORT:-8080}"
+# Set defaults (ModelScope Studio expects port 7860)
+export PORT="${PORT:-7860}"
 export HOST="${HOST:-0.0.0.0}"
 export TERM="${TERM:-xterm-256color}"
 export PYTHONUNBUFFERED=1
