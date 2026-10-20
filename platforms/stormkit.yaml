@@ -1,0 +1,22 @@
+# StormKit Deployment Config
+# Repo: macmam1/agent-node-2
+# Branch: main
+
+project: agent-node-stormkit
+
+env:
+  PORT: "8080"
+  HOST: "0.0.0.0"
+  MONITOR_TOKEN: "suga_known_token_2026"
+  BOOTSTRAP_ENABLED: "true"
+
+build:
+  dockerfile: Dockerfile
+  build_dir: .
+
+notes:
+  - "StormKit auto-detects PORT from Dockerfile EXPOSE"
+  - "WebSocket support included"
+  - "HTTP-only — use sshx.io for web terminal"
+  - "Restart every ~30-60 min — enable keepalive"
+  - "serverCmd must be: python3 /app/app.py"

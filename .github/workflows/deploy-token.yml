@@ -1,0 +1,140 @@
+name: Deploy with Secure Token
+
+# This workflow generates a secure token and makes it discoverable
+# via GitHub Actions logs after each deploy.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: "Target platform"
+        required: false
+        default: "belmo"
+        type: choice
+        options:
+          - belmo
+          - suga
+          - wispbyte
+          - alwaysdata
+
+jobs:
+  generate-token:
+    runs-on: ubuntu-latest
+    outputs:
+      token: ${{ steps.generate.outputs.TOKEN }}
+      token_masked: ${{ steps.generate.outputs.TOKEN_MASKED }}
+
+    steps:
+      - name: Generate secure MONITOR_TOKEN
+        id: generate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TOKEN=$(openssl rand -base64 32 | tr -d '/+=' | head -c 32)
+          echo "Generated token: ${TOKEN:0:4}****${TOKEN: -4}"
+          echo "TOKEN=${TOKEN}" >> $GITHUB_OUTPUT
+          echo "TOKEN_MASKED=${TOKEN:0:4}****${TOKEN: -4}" >> $GITHUB_OUTPUT
+          echo "$TOKEN" | gh secret set MONITOR_TOKEN --body -
+          echo "✅ MONITOR_TOKEN secret updated"
+
+      - name: Store token as platform env var
+        run: |
+          echo "Token: ${{ steps.generate.outputs.TOKEN_MASKED }}"
+          echo "Secret stored in GitHub Secrets as MONITOR_TOKEN"
+
+  # ─── Belmo: post-deploy token capture ──────────────────────────
+  deploy-belmo:
+    needs: generate-token
+    if: github.event_name == 'workflow_dispatch' && inputs.platform == 'belmo'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wait for service + capture token
+        env:
+          SERVICE_URL: ${{ secrets.BELMO_SERVICE_URL }}
+        run: |
+          echo "Deploying agent-node-2 to Belmo (GitHub App auto-deploy on push)..."
+          echo "Set MONITOR_TOKEN env var in Belmo dashboard (one-time)."
+          echo "Set BELMO_SERVICE_URL secret for auto token capture."
+          if [ -z "$SERVICE_URL" ]; then
+            echo "⚠️  BELMO_SERVICE_URL not set — token only in GitHub Secrets as MONITOR_TOKEN"
+          else
+            echo "Polling $SERVICE_URL/health ..."
+            for i in $(seq 1 30); do
+              STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$SERVICE_URL/health" || true)
+              if [ "$STATUS" = "200" ]; then
+                echo "✅ Service healthy"
+                BOOTSTRAP=$(curl -s "$SERVICE_URL/api/bootstrap")
+                MASK=$(echo "$BOOTSTRAP" | python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('token_masked',''))" || true)
+                TOKEN=$(echo "$BOOTSTRAP" | python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('token',''))" || true)
+                echo "✅ Token captured from running service"
+                echo "TOKEN_MASKED=$MASK" >> $GITHUB_OUTPUT
+                echo "$TOKEN" | gh secret set MONITOR_TOKEN --body - 2>/dev/null
+                echo "📋 Access terminal: $SERVICE_URL/terminal"
+                echo "📋 exec API: curl -H 'Authorization: Bearer <token>' $SERVICE_URL/api/exec"
+                break
+              fi
+              echo "  attempt $i: HTTP $STATUS — waiting..."
+              sleep 10
+            done
+          fi
+
+  deploy-suga:
+    needs: generate-token
+    if: github.event_name == 'workflow_dispatch' && inputs.platform == 'suga'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - name: Deploy to Suga (StormKit API)
+        env:
+          STORMKIT_API_KEY: ${{ secrets.STORMKIT_API_KEY }}
+          MONITOR_TOKEN: ${{ secrets.MONITOR_TOKEN }}
+        run: |
+          echo "Deploying agent-node-2 to Suga..."
+          curl -X POST https://api.stormkit.io/v1/deploy \
+            -H "Authorization: Bearer $STORMKIT_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d @- <<EOF
+          {
+            "envId": "${{ secrets.SUGA_ENV_ID }}",
+            "branch": "main",
+            "publish": true,
+            "env": { "MONITOR_TOKEN": "$MONITOR_TOKEN" }
+          }
+          EOF
+          echo "✅ Deploy triggered — token from GitHub Secrets"
+
+  # ─── Auto-deploy on every push ────────────────────────────────
+  auto-deploy:
+    needs: generate-token
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Capture token from deployed service
+        env:
+          SERVICE_URL: ${{ secrets.BELMO_SERVICE_URL }}
+        run: |
+          echo "🚀 Auto-deploy triggered by push to main"
+          echo "MONITOR_TOKEN (GitHub secret): ${{ steps.generate.outputs.TOKEN_MASKED }}"
+          if [ -n "$SERVICE_URL" ]; then
+            for i in $(seq 1 30); do
+              STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$SERVICE_URL/health" || true)
+              if [ "$STATUS" = "200" ]; then
+                BOOTSTRAP=$(curl -s "$SERVICE_URL/api/bootstrap" 2>/dev/null || echo '{}')
+                if [ "$BOOTSTRAP" != "{}" ]; then
+                  MASK=$(echo "$BOOTSTRAP" | python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('token_masked',''))" 2>/dev/null || echo "captured")
+                fi
+                echo "✅ Service live at $SERVICE_URL"
+                echo "✅ Token (from /api/bootstrap): $MASK"
+                echo "📋 Web Terminal: $SERVICE_URL/terminal"
+                echo "📋 exec API: curl -H 'Authorization: Bearer <token>' $SERVICE_URL/api/exec"
+                break
+              fi
+              echo "  attempt $i: HTTP $STATUS — waiting..."
+              sleep 10
+            done
+          else
+            echo "⚠️  Set BELMO_SERVICE_URL secret for auto token capture"
+          fi

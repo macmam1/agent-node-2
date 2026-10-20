@@ -1,0 +1,15 @@
+{
+    "dockerfile": "Dockerfile",
+    "context": ".",
+    "build": {
+        "dockerfile_path": "Dockerfile"
+    },
+    "env": {
+        "PYTHONUNBUFFERED": "1",
+        "BOOTSTRAP_ENABLED": "true"
+    },
+    "health_check": {
+        "path": "/health",
+        "port": "PORT"
+    }
+}

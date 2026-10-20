@@ -1,0 +1,26 @@
+# WispByte Deployment Config
+# Repo: macmam1/agent-node-2
+
+project: agent-node-wispbyte
+region: "US"        # or EU, ASIA
+plan: "FREE"
+
+env:
+  PORT: "8080"
+  HOST: "0.0.0.0"
+  MONITOR_TOKEN: "suga_known_token_2026"
+  BOOTSTRAP_ENABLED: "true"
+
+docker:
+  dockerfile: Dockerfile
+  ports:
+    - "8080:8080"    # Health check
+    - "22:22"          # SSH (if sshd added)
+
+ssh_access:
+  enabled: true
+
+notes:
+  - "Direct Docker + SSH access available"
+  - "Persistent containers (no sleep)"
+  - "Best option for reliable terminal access"

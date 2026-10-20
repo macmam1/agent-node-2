@@ -1,0 +1,25 @@
+# Suga.app Deployment Config
+# Repo: macmam1/agent-node-2
+# Branch: main
+
+project: agent-node-suga
+environment: production
+
+container:
+  name: agent-node
+  size: small       # 256 MiB RAM on Free tier
+  port: 8080
+  health_check: /health
+
+env:
+  PORT: "8080"
+  HOST: "0.0.0.0"
+  MONITOR_TOKEN: "suga_known_token_2026"
+  BOOTSTRAP_ENABLED: "true"
+
+notes:
+  - "Free tier: 256 MiB RAM, 0.1 vCPU, 1 GB storage"
+  - "Kubernetes-based, restarts every ~30-60 min"
+  - "HTTP-only deployments — use sshx.io as web-terminal layer"
+  - "Sleep after 15 min idle — enable keepalive"
+  - "No TCP proxy on free tier — use web terminal or sshx"

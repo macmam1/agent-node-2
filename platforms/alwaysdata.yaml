@@ -1,0 +1,23 @@
+# AlwaysData Deployment Config
+# Repo: macmam1/agent-node-2
+
+project: agent-node-alwaysdata
+
+env:
+  PORT: "<auto-assigned>"
+  HOST: "0.0.0.0"
+  MONITOR_TOKEN: "<generate-random>"
+  BOOTSTRAP_ENABLED: "true"
+
+deployment:
+  type: "docker"
+  dockerfile_path: Dockerfile
+
+ssh_access:
+  enabled: true
+
+notes:
+  - "Free tier: 1 GB disk, 256 MiB RAM"
+  - "SSH access included on all tiers"
+  - "Persistent daemon (never sleeps)"
+  - "Custom domains supported"

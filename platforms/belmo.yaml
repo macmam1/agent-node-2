@@ -1,0 +1,44 @@
+# Belmo.io Deployment Config
+# Repo: macmam1/agent-node-2
+# Free tier: 1 service, forever, no credit card
+
+name: agent-node-belmo
+service_type: api
+language: python
+branch: main
+
+build:
+  requirements: requirements.txt
+  start_command: python3 app.py
+
+server:
+  port_env: PORT
+  health_path: /health
+
+env:
+  # If MONITOR_TOKEN is not set, app auto-generates one.
+  # BOOTSTRAP_ENABLED=true allows first-time token capture via /api/bootstrap
+  BOOTSTRAP_ENABLED: "true"
+
+init:
+  - name: "Verify health"
+    check: "GET /health (expect 200)"
+  - name: "Capture token"
+    check: "GET /api/bootstrap (unauthenticated — returns token)"
+  - name: "Verify web terminal"
+    check: "GET /terminal (expect 200)"
+  - name: "Verify sshx"
+    check: "GET /api/sshx (with Bearer token from bootstrap)"
+
+access:
+  web_terminal: "https://<app>.app.belmo.io/terminal"
+  bootstrap: "https://<app>.app.belmo.io/api/bootstrap"
+  health: "https://<app>.app.belmo.io/health"
+  sshx_api: "https://<app>.app.belmo.io/api/sshx"
+  exec_api: "https://<app>.app.belmo.io/api/exec"
+
+notes:
+  - "Always-on (never sleeps)"
+  - "EU (Germany) or US (Oregon) regions"
+  - "Auto-deploy on every push to main"
+  - "Set BELMO_SERVICE_URL in GitHub Secrets for auto token capture in CI"

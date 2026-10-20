@@ -1,0 +1,33 @@
+# agent-node v2.0 Configuration
+# ─────────────────────────────────
+service:
+  name: agent-node
+  version: "2.0"
+  description: "Lightweight deployment node for terminal access"
+
+server:
+  host: "0.0.0.0"
+  port: 8080  # Overridden by PORT env var at runtime
+
+# Authentication for API endpoints
+auth:
+  token: "${MONITOR_TOKEN}"  # Set via environment variable
+  bootstrap_enabled: "${BOOTSTRAP_ENABLED}"  # true = /api/bootstrap open, false = auth required
+  # Endpoints /api/* and /ws/* require Bearer token (except bootstrap when enabled)
+
+# SSH settings
+ssh:
+  auto_start: true
+
+# Health monitoring
+monitoring:
+  health_path: /health
+  metrics_path: /api/diagnostics
+  interval: 30
+
+# Logging
+logging:
+  level: info
+  dir: /var/log/agent-node
+  max_size: 10MB
+  max_files: 3
