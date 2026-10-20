@@ -3,23 +3,17 @@
 # Primary: Web health-check + monitoring service
 # Secondary: Token discovery, command exec, WebSocket terminal
 #
-# Built from: Python 3.12-slim — reliable, widely cached
+# Uses python:3.12-slim (Debian-based) with CN pip mirror for
+# ModelScope Studio compatibility
 # ──────────────────────────────────────────────────────────────
 
 FROM python:3.12-slim
 
-# ─── System packages ────────────────────────────────────────────
-RUN apt-get update -qq 2>/dev/null && \
-    apt-get install -y --no-install-recommends \
-        bash curl wget git nano tmux \
-        openssh-client iproute2 net-tools \
-    2>&1 | tail -3 && \
-    rm -rf /var/lib/apt/lists/* && \
-    echo "SSH client: $(which ssh || echo 'NOT FOUND')"
-
-# ─── Python dependencies ────────────────────────────────────────
-# Use pip directly (python:3.12-slim has it built-in)
-RUN pip install --no-cache-dir --quiet aiohttp pyyaml
+# ─── Python dependencies (CN mirror for ModelScope) ─────────────
+RUN pip install --no-cache-dir --quiet \
+    --index-url https://pypi.tuna.tsinghua.edu.cn/simple \
+    --extra-index-url https://pypi.org/simple \
+    aiohttp pyyaml
 
 # ─── App setup ─────────────────────────────────────────────────
 WORKDIR /app
