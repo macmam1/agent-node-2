@@ -391,12 +391,6 @@ if __name__ == "__main__":
     print(f"Platform: {', '.join(_detect_platform())}")
     print(f"Tools: ssh={bool(shutil.which('ssh'))} curl={bool(shutil.which('curl'))} bash={bool(shutil.which('bash'))}")
 
-    demo.load(
-        fn=lambda: health_check(),
-        inputs=None,
-        outputs=gr.Label(visible=False),
-    )
-
     demo.queue()
     demo.launch(
         server_name=HOST,
