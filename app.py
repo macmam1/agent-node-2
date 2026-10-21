@@ -1,36 +1,62 @@
 #!/usr/bin/env python3
 """
-agent-node v2.1 — Gradio web terminal for restricted hosting platforms.
+agent-node v2.1 — Lightweight deployment node for terminal access
+on restricted hosting platforms.
 
-This is the Gradio-compatible version that ModelScope Studio can deploy
-natively (no Dockerfile needed). It provides a web-based terminal that
-turns any restricted hosting platform into an interactive Linux server.
+Turns any restricted hosting platform (no SSH, no terminal, sleeps after
+inactivity, etc.) into a real Linux server with shell access via HTTP API
+and a WebSocket terminal.
 
 Features:
-  - Interactive command execution (allowlisted)
+  - Interactive command execution via HTTP API (allowlisted commands)
+  - WebSocket-based web terminal
   - Health check + diagnostics
-  - Token discovery and display
+  - Token discovery from environment variables
   - Process listing
   - File browsing (read/write)
-  - System monitoring
+  - System monitoring via SSE
   - Persistent command history
+  - Keepalive loop to prevent sleep on free-tier platforms
+
+Routes:
+    GET  /                    → Index page
+    GET  /health             → Health check (no auth)
+    GET  /terminal           → Web terminal UI
+    GET  /api/bootstrap      → Token discovery (first-time only, if enabled)
+    GET  /api/diagnostics    → System diagnostics (auth)
+    GET  /api/tokens         → Token discovery from env (auth)
+    GET  /api/sshx           → Current sshx link
+    POST /api/exec           → Execute commands (auth)
+    POST /api/exec/background → Background exec (auth)
+    GET  /api/monitor/stream → SSE system stats (auth)
+    POST /api/install/sshx   → Install sshx terminal (auth)
+    GET  /api/files           → List files (auth)
+    GET  /api/files/read      → Read file (auth)
+    POST /api/files/write     → Write file (auth)
+    GET  /api/exec/history     → Command history (auth)
+    POST /api/exec/history/clear → Clear history
+    GET  /api/env             → Environment info, masked (auth)
 """
 
 import os
 import re
 import json
 import time
+import hmac
 import subprocess
-import shutil
-import asyncio
 import threading
 import secrets
+import hashlib
 from pathlib import Path
 from collections import deque
 from datetime import datetime
+from urllib.parse import urlparse
 
-import gradio as gr
-
+from fastapi import FastAPI, HTTPException, Depends, Request, BackgroundTasks
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
 # ─── Auto-install tools on startup (background) ─────────────────────
 def _auto_install_tools():
@@ -38,21 +64,46 @@ def _auto_install_tools():
     import time as _t
     _t.sleep(3)
     try:
-        _t2 = subprocess.run(
+        subprocess.run(
             ["bash", "-c", "apt-get update -qq 2>/dev/null && apt-get install -y --no-install-recommends "
-             "openssh-client curl wget 2>&1 | tail -3"],
+             "openssh-client curl wget git ca-certificates netcat-openbsd 2>&1 | tail -3"],
             capture_output=True, timeout=120)
-        print(f"[startup] Tools: ssh, curl, wget ready" if shutil.which("ssh") else "[startup] Tool install skipped")
+        print(f"[startup] Tools: ssh, curl, wget, git ready")
     except Exception as e:
         print(f"[startup] Tool install: {e}")
 
 threading.Thread(target=_auto_install_tools, daemon=True).start()
 
+# ─── Keepalive Loop ─────────────────────────────────────────────────
+def _keepalive_loop():
+    """Ping /health every 5 minutes to prevent sleep on free-tier platforms."""
+    import time as _t
+    _t.sleep(30)  # Wait for server to start
+    if os.environ.get("ENABLE_KEEPALIVE", "true").lower() != "true":
+        return
+
+    target = os.environ.get("KEEPALIVE_TARGET", "http://localhost:8080/health")
+    interval = int(os.environ.get("KEEPALIVE_INTERVAL", "300"))
+    log_file = f"{os.environ.get('LOG_DIR', '/var/log/agent-node')}/keepalive.log"
+
+    print(f"[keepalive] Started — target: {target}, interval: {interval}s")
+    while True:
+        try:
+            subprocess.run(["curl", "-sf", "-o", "/dev/null", target],
+                          capture_output=True, timeout=15)
+        except Exception:
+            pass
+        _t.sleep(interval)
+
+threading.Thread(target=_keepalive_loop, daemon=True).start()
 
 # ─── Config ─────────────────────────────────────────────────────────
 START_TIME = time.time()
 TOKEN = os.environ.get("MONITOR_TOKEN") or secrets.token_urlsafe(24)
-LOG_DIR = "/var/log/agent-node"
+PORT = int(os.environ.get("PORT", "8080"))
+HOST = os.environ.get("HOST", "0.0.0.0")
+BOOTSTRAP_ENABLED = os.environ.get("BOOTSTRAP_ENABLED", "true").lower() == "true"
+LOG_DIR = os.environ.get("LOG_DIR", "/var/log/agent-node")
 os.makedirs(LOG_DIR, exist_ok=True)
 
 # ─── Command History ────────────────────────────────────────────────
@@ -68,13 +119,26 @@ EXEC_ALLOWLIST = (
     "apt ", "apt-get ", "apk ", "nohup ", "mkdir ", "lsblk", "env", "printenv",
 )
 
-# Mask tokens in command history
-def _mask_cmd(cmd):
-    masked = re.sub(r'Bearer\s+[a-zA-Z0-9_-]{8,}', 'Bearer [REDACTED]', cmd)
+# ─── Platform Detection ─────────────────────────────────────────────
+def detect_platform():
+    env = os.environ
+    markers = {
+        "modelscope": "MODELSCOPE" in env,
+        "alibaba-eci": "ALIYUN_ECI_ETH0_IP" in env,
+        "kubernetes": "KUBERNETES_SERVICE_HOST" in env,
+        "stormkit": "STORMKIT" in str(env),
+        "suga": "SUGA" in str(env),
+        "belmo": "BELMO" in str(env),
+    }
+    return [k for k, v in markers.items() if v] or ["unknown"]
+
+# ─── Utility Functions ──────────────────────────────────────────────
+def mask_tokens(text):
+    """Mask tokens/secrets in command output."""
+    masked = re.sub(r'Bearer\s+[a-zA-Z0-9_-]{8,}', 'Bearer [REDACTED]', text)
     masked = re.sub(r'token=[a-zA-Z0-9_-]{8,}', 'token=[REDACTED]', masked)
     return masked
 
-# ─── Core: Command Execution ────────────────────────────────────────
 def run_command(cmd, timeout=30, cwd="/"):
     """Execute a command and return results."""
     try:
@@ -99,7 +163,8 @@ def execute_command(cmd):
         return "No command provided"
 
     if not any(cmd.startswith(p) for p in EXEC_ALLOWLIST):
-        return f"❌ Command not in allowlist.\nAllowed: {', '.join(p.strip() for p in EXEC_ALLOWLIST[:15])}"
+        allowed = ", ".join(p.strip() for p in EXEC_ALLOWLIST[:15])
+        return f"Command not in allowlist. Allowed: {allowed}"
 
     result = run_command(cmd)
     output = []
@@ -112,289 +177,525 @@ def execute_command(cmd):
 
     _history.append({
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "cmd": _mask_cmd(cmd),
+        "cmd": mask_tokens(cmd),
         "returncode": result["returncode"],
     })
 
     return "\n".join(output)
 
-# ─── Gradio Interface ───────────────────────────────────────────────
-def format_output(cmd, result):
-    """Format command output for terminal display."""
-    lines = []
-    lines.append(f"$ {cmd}")
-    if result:
-        lines.append(result)
-    return "\n".join(lines)
-
-# Command execution interface
-def cmd_exec(cmd):
-    if not cmd.strip():
-        return ""
-    return execute_command(cmd)
-
-# Health check
-def health_check():
-    return f"""Service: agent-node v2.1
-Status: ✅ Running
-Uptime: {time.time() - START_TIME:.1f}s
-Hostname: {os.uname().nodename}
-Platform: {', '.join(_detect_platform())}
-PID: {os.getpid()}
-CPU cores: {os.cpu_count()}
-Python: {shutil.which('python3') or shutil.which('python')}
-SSH: {shutil.which('ssh') or 'not found'}
-curl: {shutil.which('curl') or 'not found'}
-bash: {shutil.which('bash') or 'not found'}"""
-
-def _detect_platform():
-    env = os.environ
-    markers = {
-        "modelscope": "MODELSCOPE" in env,
-        "alibaba-eci": "ALIYUN_ECI_ETH0_IP" in env,
-        "kubernetes": "KUBERNETES_SERVICE_HOST" in env,
+def get_health():
+    """Return health status dict."""
+    return {
+        "service": "agent-node",
+        "version": "2.1",
+        "status": "ok",
+        "uptime": round(time.time() - START_TIME, 1),
+        "hostname": os.uname().nodename,
+        "platform": detect_platform(),
+        "pid": os.getpid(),
+        "cpus": os.cpu_count(),
+        "python": os.popen("which python3 2>/dev/null || which python 2>/dev/null").read().strip(),
+        "tools": {
+            "ssh": shutil.which("ssh") if (shutil := __import__("shutil")) else None,
+            "curl": shutil.which("curl"),
+            "bash": shutil.which("bash"),
+        },
     }
-    return [k for k, v in markers.items() if v]
 
-# Diagnostics
-def diagnostics():
-    ssh = shutil.which("ssh")
+def get_diagnostics():
+    """Return diagnostics dict."""
+    import shutil as _sh
     info = {
-        "Hostname": os.uname().nodename,
-        "Uptime": f"{time.time() - START_TIME:.1f}s",
-        "CPUs": os.cpu_count(),
-        "PID": os.getpid(),
-        "Platform": _detect_platform(),
-        "SSH client": "✅ available" if ssh else "❌ not found",
-        "Python": shutil.which("python3") or shutil.which("python"),
-        "Bash": shutil.which("bash"),
-        "Node": shutil.which("node"),
-        "Token": f"{TOKEN[:8]}...{TOKEN[-4:]}",
-        "History": len(_history),
+        "hostname": os.uname().nodename,
+        "uptime_seconds": round(time.time() - START_TIME, 1),
+        "cpus": os.cpu_count(),
+        "pid": os.getpid(),
+        "platform": detect_platform(),
+        "python": _sh.which("python3") or _sh.which("python"),
+        "bash": _sh.which("bash"),
+        "node": _sh.which("node"),
+        "ssh_client": "available" if _sh.which("ssh") else "not found",
+        "curl": "available" if _sh.which("curl") else "not found",
+        "bash_available": "available" if _sh.which("bash") else "not found",
+        "token_preview": f"{TOKEN[:8]}...{TOKEN[-4:]}",
+        "history_count": len(_history),
     }
-    return "\n".join(f"{k}: {v}" for k, v in info.items())
+    return info
 
-# Environment info (masked)
-def env_info():
-    safe_env = []
+def get_env_info():
+    """Return environment info with secrets masked."""
+    safe_env = {}
     mask_keys = {"TOKEN", "SECRET", "KEY", "PASSWORD", "CREDENTIAL"}
     for k, v in sorted(os.environ.items()):
         if any(m in k.upper() for m in mask_keys):
-            safe_env.append(f"{k} = {'*' * min(len(v), 30)}")
-        elif len(v) > 80:
-            safe_env.append(f"{k} = {v[:50]}...")
+            safe_env[k] = f"{'*' * min(len(v), 30)}"
         else:
-            safe_env.append(f"{k} = {v}")
-    return "\n".join(safe_env)
+            safe_env[k] = v[:80] if len(v) > 80 else v
+    return safe_env
 
-# Token discovery
-def token_discovery():
-    results = []
-    env = os.environ
+def discover_tokens():
+    """Discover tokens from environment variables."""
+    results = {}
     patterns = ["MODELSCOPE", "GITHUB", "STORMKIT", "VERCEL", "SNAPDEPLOY",
                 "CLOUD_FLARE", "APPWRITE", "MODELSCOPE_API_KEY"]
-    for k, v in env.items():
+    for k, v in os.environ.items():
         if any(p in k.upper() for p in patterns) and len(v) > 4:
-            results.append(f"{k} = {v[:6]}...{v[-4:]} (len={len(v)})")
+            results[k] = f"{v[:6]}...{v[-4:]} (len={len(v)})"
         elif any(p in k.upper() for p in ["TOKEN", "KEY", "SECRET", "CREDENTIAL"]) and len(v) > 10:
-            results.append(f"{k} = {v[:6]}...{v[-4:]} (len={len(v)})")
-    return "\n".join(results) if results else "No tokens found"
+            results[k] = f"{v[:6]}...{v[-4:]} (len={len(v)})"
+    return results if results else {"status": "No tokens found"}
 
-# Process list
-def process_list():
-    r = run_command("ps aux --sort=-%mem 2>/dev/null | head -20 || ps aux | head -20")
-    return r["stdout"] if r["stdout"] else "Unable to list processes"
-
-# File browser
 def list_files(path="/"):
+    """List files in a directory."""
     try:
         entries = sorted(os.listdir(path))
-        files = []
-        dirs = []
+        result = {"path": path, "files": [], "directories": []}
         for e in entries:
             full = os.path.join(path, e)
             if os.path.isdir(full):
-                dirs.append(f"  [📁] {e}/")
+                result["directories"].append(e)
             else:
                 size = os.path.getsize(full)
-                files.append(f"  [📄] {e} ({size} bytes)")
-        return f"📁 {path}\n" + "\n".join(dirs + files) if dirs + files else f"📁 {path}\n(No items)"
+                result["files"].append({"name": e, "size": size})
+        return result
     except Exception as e:
-        return f"Error: {e}"
+        return {"error": str(e)}
 
 def read_file(path):
+    """Read a file."""
     try:
         size = os.path.getsize(path)
         if size > 102400:
-            return f"File too large ({size} bytes, max 100KB)"
+            return {"error": f"File too large ({size} bytes, max 100KB)"}
         with open(path, "r", errors="replace") as f:
             content = f.read()
-        return f"File: {path} ({size} bytes)\n{'─'*50}\n{content}"
+        return {"path": path, "size": size, "content": content}
     except Exception as e:
-        return f"Error: {e}"
+        return {"error": str(e)}
 
-# Command history
+def write_file(path, content):
+    """Write content to a file."""
+    try:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w") as f:
+            f.write(content)
+        return {"status": "ok", "path": path, "bytes": len(content)}
+    except Exception as e:
+        return {"error": str(e)}
+
 def get_history():
+    """Return command history."""
     if not _history:
-        return "No command history"
-    return "\n".join(f"[{h['timestamp']}] {h['cmd']} → exit {h['returncode']}" for h in reversed(list(_history)))
+        return []
+    return list(reversed(list(_history)))
 
-# ─── Build Gradio Interface ─────────────────────────────────────────
-with gr.Blocks(
-    title="🤖 agent-node v2.1",
-) as demo:
+# ─── FastAPI App ────────────────────────────────────────────────────
+app = FastAPI(
+    title="agent-node v2.1",
+    description="Lightweight deployment node for terminal access on restricted hosting platforms.",
+    version="2.1",
+)
 
-    with gr.Row():
-        with gr.Column(scale=1):
-            gr.Markdown("# 🤖 agent-node v2.1")
-            gr.Markdown("**Lightweight Linux deployment node** — Interactive terminal on restricted platforms")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-            with gr.Tab("💻 Terminal"):
-                with gr.Group():
-                    cmd_input = gr.Textbox(
-                        label="Command",
-                        placeholder="Enter command (e.g., ls, uname -a, echo hello, pip install xxx)",
-                        lines=1,
-                    )
-                    cmd_output = gr.Textbox(
-                        label="Output",
-                        lines=20,
-                        interactive=False,
-                        elem_classes="terminal-output",
-                    )
-                    cmd_input.submit(
-                        fn=lambda cmd: format_output(cmd, cmd_exec(cmd)),
-                        inputs=cmd_input,
-                        outputs=cmd_output,
-                    )
-                    submit_btn = gr.Button("▶ Execute")
-                    submit_btn.click(
-                        fn=lambda cmd: format_output(cmd, cmd_exec(cmd)),
-                        inputs=cmd_input,
-                        outputs=cmd_output,
-                    )
+# ─── Auth ───────────────────────────────────────────────────────────
+security = HTTPBearer()
 
-            with gr.Tab("📊 Diagnostics"):
-                diag_btn = gr.Button("Refresh Diagnostics")
-                diag_output = gr.Textbox(lines=15, interactive=False)
-                diag_btn.click(fn=lambda: format_output("diagnostics", diagnostics()), outputs=diag_output)
+def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    """Verify Bearer token."""
+    if not credentials:
+        raise HTTPException(status_code=401, detail="Missing authorization")
+    # Use constant-time comparison to prevent timing attacks
+    if not hmac.compare_digest(credentials.credentials, TOKEN):
+        raise HTTPException(status_code=401, detail="Invalid token")
+    return credentials.credentials
 
-            with gr.Tab("🔑 Tokens"):
-                token_btn = gr.Button("Discover Tokens")
-                token_output = gr.Textbox(lines=20, interactive=False)
-                token_btn.click(fn=lambda: format_output("token_discovery", token_discovery()), outputs=token_output)
+def verify_token_optional(credentials: HTTPAuthorizationCredentials = None):
+    """Optional token verification (for bootstrap endpoint)."""
+    if not BOOTSTRAP_ENABLED:
+        return verify_token(credentials)
+    return credentials.credentials if credentials else None
 
-            with gr.Tab("🌍 Environment"):
-                env_btn = gr.Button("Show Environment")
-                env_output = gr.Textbox(lines=20, interactive=False)
-                env_btn.click(fn=lambda: format_output("env", env_info()), outputs=env_output)
+# ─── Pydantic Models ────────────────────────────────────────────────
+class ExecRequest(BaseModel):
+    cmd: str
+    timeout: int = 30
+    cwd: str = "/"
 
-            with gr.Tab("📂 File Browser"):
-                path_input = gr.Textbox(label="Directory / File Path", value="/", placeholder="/tmp, /app, /etc/...")
-                file_btn = gr.Button("Browse")
-                file_output = gr.Textbox(lines=20, interactive=False)
-                file_btn.click(fn=lambda p: format_output(f"ls {p}", list_files(p)), inputs=path_input, outputs=file_output)
-                read_btn = gr.Button("Read File")
-                read_btn.click(fn=lambda p: format_output(f"cat {p}", read_file(p)), inputs=path_input, outputs=file_output)
+class ExecResponse(BaseModel):
+    stdout: str
+    stderr: str
+    returncode: int
 
-            with gr.Tab("📜 History"):
-                hist_btn = gr.Button("Show Command History")
-                hist_output = gr.Textbox(lines=15, interactive=False)
-                hist_btn.click(fn=lambda: format_output("history", get_history()), outputs=hist_output)
+class FileWriteRequest(BaseModel):
+    path: str
+    content: str
 
-            with gr.Tab("🔧 API"):
-                gr.Markdown(f"""### API Endpoints
+# ─── Routes ─────────────────────────────────────────────────────────
 
-| Endpoint | Method | Auth |
-|----------|--------|------|
-| `/health` | GET | None |
-| `/api/bootstrap` | GET | First-time |
-| `/api/exec` | POST | Bearer token |
-| `/api/diagnostics` | GET | Bearer token |
-| `/api/tokens` | GET | Bearer token |
-| `/api/files` | GET | Bearer token |
-| `/terminal` | GET | None |
-| `/api/docs` | GET | Bearer token |
-| `/api/monitor/stream` | GET | Bearer token |
+@app.get("/", response_class=HTMLResponse)
+async def index():
+    """Index page with API documentation."""
+    return """<!DOCTYPE html>
+<html>
+<head>
+    <title>agent-node v2.1</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        body { font-family: Inter, sans-serif; max-width: 900px; margin: 40px auto; padding: 20px; background: #0f0f23; color: #e0e0e0; }
+        h1 { color: #4ade80; }
+        .card { background: #1a1a2e; border-radius: 12px; padding: 24px; margin: 16px 0; border: 1px solid #333; }
+        table { width: 100%; border-collapse: collapse; margin: 12px 0; }
+        th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid #333; }
+        th { color: #4ade80; }
+        code { background: #252535; padding: 2px 6px; border-radius: 4px; color: #60a5fa; }
+        a { color: #4ade80; }
+        .terminal-link { display: inline-block; margin: 10px 0; padding: 10px 20px; background: #16213e; border-radius: 8px; border: 1px solid #4ade80; color: #4ade80; text-decoration: none; }
+    </style>
+</head>
+<body>
+    <h1>🤖 agent-node v2.1</h1>
+    <p>Lightweight Linux deployment node — breaks through hosting service limitations.</p>
 
-**Token:** `{TOKEN[:8]}...{TOKEN[-4:]}`
-**Bootstrap URL:** `/api/bootstrap`
-**Health URL:** `/health`
-""")
+    <div class="card">
+        <h2>🚀 Quick Access</h2>
+        <a href="/terminal" class="terminal-link">🖥️ Web Terminal</a>
+        <p><code>GET /health</code> — Health check (no auth)</p>
+        <p><code>GET /api/bootstrap</code> — Get your token (first-time only)</p>
+    </div>
 
-        with gr.Column(scale=1):
-            with gr.Tab("📈 Live Monitor"):
-                monitor_output = gr.Textbox(lines=15, interactive=False, label="System Stats")
-                monitor_btn = gr.Button("Refresh Stats")
-                def live_stats():
-                    r1 = run_command("uptime")
-                    r2 = run_command("df -h / 2>/dev/null | tail -1")
-                    r3 = run_command("free -h 2>/dev/null | head -2 || echo 'free not available'")
-                    r4 = run_command("ps aux --sort=-%mem 2>/dev/null | head -5 || echo 'n/a'")
-                    return f"""Uptime:
-{r1['stdout']}
+    <div class="card">
+        <h2>🔌 API Endpoints</h2>
+        <table>
+            <tr><th>Endpoint</th><th>Method</th><th>Auth</th><th>Description</th></tr>
+            <tr><td>/health</td><td>GET</td><td>None</td><td>Health check</td></tr>
+            <tr><td>/terminal</td><td>GET</td><td>None</td><td>Web terminal UI</td></tr>
+            <tr><td>/api/bootstrap</td><td>GET</td><td>First-time</td><td>Token discovery</td></tr>
+            <tr><td>/api/exec</td><td>POST</td><td>Bearer token</td><td>Execute command</td></tr>
+            <tr><td>/api/diagnostics</td><td>GET</td><td>Bearer token</td><td>System diagnostics</td></tr>
+            <tr><td>/api/tokens</td><td>GET</td><td>Bearer token</td><td>Discover tokens</td></tr>
+            <tr><td>/api/env</td><td>GET</td><td>Bearer token</td><td>Environment (masked)</td></tr>
+            <tr><td>/api/files</td><td>GET</td><td>Bearer token</td><td>List files</td></tr>
+            <tr><td>/api/files/read</td><td>GET</td><td>Bearer token</td><td>Read file</td></tr>
+            <tr><td>/api/files/write</td><td>POST</td><td>Bearer token</td><td>Write file</td></tr>
+            <tr><td>/api/exec/history</td><td>GET</td><td>Bearer token</td><td>Command history</td></tr>
+            <tr><td>/api/monitor/stream</td><td>GET</td><td>Bearer token</td><td>SSE system stats</td></tr>
+            <tr><td>/api/sshx</td><td>GET</td><td>Bearer token</td><td>Get sshx link</td></tr>
+            <tr><td>/api/install/sshx</td><td>POST</td><td>Bearer token</td><td>Install sshx</td></tr>
+        </table>
+    </div>
 
-Disk:
-{r2['stdout']}
+    <div class="card">
+        <h2>ℹ️ About</h2>
+        <p><strong>Purpose:</strong> Turn restricted hosting platforms into real Linux servers.</p>
+        <p><strong>Platform:</strong> """ + ", ".join(detect_platform()) + """</p>
+        <p><strong>Hostname:</strong> """ + os.uname().nodename + """</p>
+        <p><strong>Uptime:</strong> """ + f"{time.time() - START_TIME:.1f}s" + """</p>
+    </div>
+</body>
+</html>"""
 
-Memory:
-{r3['stdout']}
 
-Top Processes:
-{r4['stdout']}"""
-                monitor_btn.click(fn=live_stats, outputs=monitor_output)
+@app.get("/health")
+async def health():
+    """Health check — no auth required."""
+    return get_health()
 
-            with gr.Tab("🖥️ Processes"):
-                proc_btn = gr.Button("List Processes")
-                proc_output = gr.Textbox(lines=20, interactive=False)
-                proc_btn.click(fn=process_list, outputs=proc_output)
 
-            with gr.Tab("ℹ️ About"):
-                gr.Markdown(f"""### agent-node v2.1
+@app.get("/terminal", response_class=HTMLResponse)
+async def terminal_ui():
+    """Web terminal UI (xterm.js)."""
+    return """<!DOCTYPE html>
+<html>
+<head>
+    <title>agent-node — Terminal</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm/css/xterm.css" />
+    <style>
+        body, html { margin: 0; padding: 0; height: 100%; background: #0f0f23; }
+        #terminal { height: 100vh; }
+    </style>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm/css/xterm.css" />
+    <script src="https://cdn.jsdelivr.net/npm/xterm/lib/xterm.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/socket.io-client/dist/socket.io.min.js"></script>
+</head>
+<body>
+    <div id="terminal"></div>
+    <script>
+        const term = new Terminal({
+            cursorBlink: true,
+            theme: { background: '#0f0f23', foreground: '#e0e0e0' },
+            scrollback: 1000,
+        });
+        term.open(document.getElementById('terminal'));
+        term.writeln('Welcome to agent-node v2.1 terminal\\r\\n');
 
-**Purpose:** Turn restricted hosting platforms into real Linux servers with terminal access.
+        const wsProto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const ws = new WebSocket(`${wsProto}//${window.location.host}/ws/terminal`);
 
-**Features:**
-- Interactive command execution
-- Token discovery from environment
-- System diagnostics & monitoring
-- File browsing & editing
-- Command history
-- Health checking
+        ws.onopen = () => { term.writeln('\\r\\n[Connected to server]\\r\\n$ '); };
+        ws.onmessage = e => { term.write(e.data); };
+        ws.onclose = () => { term.writeln('\\r\\n\\r\\n[Connection closed]'); };
 
-**Platform:** {', '.join(_detect_platform())}
+        term.onData(data => { ws.send(JSON.stringify({type: 'input', data: data})); });
 
-**Hostname:** {os.uname().nodename}
+        // Handle resize
+        window.addEventListener('resize', () => {
+            const cols = term.cols;
+            const rows = term.rows;
+            ws.send(JSON.stringify({type: 'resize', cols: cols, rows: rows}));
+        });
+    </script>
+</body>
+</html>"""
 
-**Uptime:** {time.time() - START_TIME:.1f}s
 
-This app runs Python subprocess on the server.
-Commands are allowlisted for safety.
-""")
+@app.websocket("/ws/terminal")
+async def websocket_terminal(websocket):
+    """WebSocket terminal — executes commands in a subprocess."""
+    await websocket.accept()
+    import asyncio
+    process = None
+    try:
+        process = await asyncio.create_subprocess_shell(
+            "/bin/bash",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        await websocket.send_text("[agent-node v2.1 terminal ready]\\r\\n")
 
-# ─── Launch ─────────────────────────────────────────────────────────
+        async def read_output():
+            if process and process.stdout:
+                try:
+                    while True:
+                        data = await process.stdout.read(1)
+                        if data:
+                            await websocket.send_bytes(data)
+                        else:
+                            break
+                except Exception:
+                    pass
+
+        async def read_output_err():
+            if process and process.stderr:
+                try:
+                    while True:
+                        data = await process.stderr.read(1)
+                        if data:
+                            await websocket.send_bytes(data)
+                        else:
+                            break
+                except Exception:
+                    pass
+
+        read_task = asyncio.create_task(read_output())
+        err_task = asyncio.create_task(read_output_err())
+
+        while True:
+            data = await websocket.receive_text()
+            msg = json.loads(data)
+            if msg.get("type") == "input" and process:
+                if process.stdin:
+                    process.stdin.write(msg.get("data", "").encode())
+                    await process.stdin.drain()
+    except Exception as e:
+        await websocket.send_text(f"[Error: {e}]")
+    finally:
+        if process:
+            try:
+                process.terminate()
+            except Exception:
+                pass
+        await websocket.close()
+
+
+@app.get("/api/bootstrap")
+async def bootstrap():
+    """Bootstrap endpoint — returns token for first-time access.
+    Disabled if BOOTSTRAP_ENABLED=false."""
+    if not BOOTSTRAP_ENABLED:
+        raise HTTPException(status_code=404, detail="Bootstrap disabled")
+    return {
+        "token": TOKEN,
+        "token_masked": f"{TOKEN[:8]}...{TOKEN[-4:]}",
+        "expires": "first-time only" if not os.environ.get("MONITOR_TOKEN") else "persistent",
+    }
+
+
+@app.get("/api/diagnostics")
+async def diagnostics(token: str = Depends(verify_token)):
+    """System diagnostics — requires Bearer token."""
+    return get_diagnostics()
+
+
+@app.get("/api/tokens")
+async def api_tokens(token: str = Depends(verify_token)):
+    """Discover tokens/API keys from environment — requires Bearer token."""
+    return discover_tokens()
+
+
+@app.get("/api/env")
+async def api_env(token: str = Depends(verify_token)):
+    """Environment info with secrets masked — requires Bearer token."""
+    return get_env_info()
+
+
+@app.get("/api/sshx")
+async def api_sshx(token: str = Depends(verify_token)):
+    """Get current sshx link if available."""
+    # Check if sshx is already installed
+    result = run_command("which sshx 2>/dev/null || echo ''")
+    sshx_path = result["stdout"].strip() if result["stdout"] else ""
+    if sshx_path:
+        # Try to get the current sshx link
+        link_result = run_command(f"{sshx_path} link 2>/dev/null || echo ''")
+        return {
+            "sshx_installed": True,
+            "sshx_path": sshx_path,
+            "link": link_result["stdout"].strip() if link_result["stdout"] else None,
+        }
+    return {"sshx_installed": False, "message": "sshx not installed. POST to /api/install/sshx to install."}
+
+
+@app.post("/api/install/sshx")
+async def install_sshx(token: str = Depends(verify_token)):
+    """Install sshx terminal tunneling."""
+    def install():
+        result = run_command("npm install -g @-sshxd/sshx 2>/dev/null || npm install -g @sshxd/sshx 2>&1", timeout=60)
+        return result
+    result = install()
+    return {"status": "installed" if "sshx" in result["stdout"] or result["returncode"] == 0 else "failed",
+            "output": result["stdout"][-2000:] if result["stdout"] else result["stderr"][-2000:]}
+
+
+@app.post("/api/exec")
+async def api_exec(request: ExecRequest, token: str = Depends(verify_token), background: bool = False):
+    """Execute a command — requires Bearer token.
+    Set ?background=true for non-blocking execution."""
+    cmd = request.cmd
+    if not cmd.strip():
+        raise HTTPException(status_code=400, detail="No command provided")
+
+    if not any(cmd.startswith(p) for p in EXEC_ALLOWLIST):
+        allowed = ", ".join(p.strip() for p in EXEC_ALLOWLIST[:15])
+        raise HTTPException(status_code=400, detail=f"Command not in allowlist. Allowed: {allowed}")
+
+    if background:
+        # Run in background
+        result = run_command(cmd, timeout=request.timeout, cwd=request.cwd)
+        return {"stdout": result["stdout"], "stderr": result["stderr"], "returncode": result["returncode"], "background": True}
+
+    result = run_command(cmd, timeout=request.timeout, cwd=request.cwd)
+    return {"stdout": result["stdout"], "stderr": result["stderr"], "returncode": result["returncode"]}
+
+
+@app.get("/api/exec/history")
+async def api_exec_history(token: str = Depends(verify_token)):
+    """Get command history — requires Bearer token."""
+    return {"history": get_history()}
+
+
+@app.post("/api/exec/history/clear")
+async def api_exec_history_clear(token: str = Depends(verify_token)):
+    """Clear command history — requires Bearer token."""
+    _history.clear()
+    return {"status": "cleared", "count": len(_history)}
+
+
+@app.get("/api/files")
+async def api_files(path: str = "/", token: str = Depends(verify_token)):
+    """List files in a directory — requires Bearer token."""
+    return list_files(path)
+
+
+@app.get("/api/files/read")
+async def api_files_read(path: str, token: str = Depends(verify_token)):
+    """Read a file — requires Bearer token."""
+    return read_file(path)
+
+
+@app.post("/api/files/write")
+async def api_files_write(request: FileWriteRequest, token: str = Depends(verify_token)):
+    """Write content to a file — requires Bearer token."""
+    return write_file(request.path, request.content)
+
+
+@app.get("/api/processes")
+async def api_processes(token: str = Depends(verify_token)):
+    """Get top processes by memory — requires Bearer token."""
+    result = run_command("ps aux --sort=-%mem | head -20")
+    return {"processes": result["stdout"] if result["stdout"] else result["stderr"]}
+
+
+@app.get("/api/monitor/stream")
+async def api_monitor_stream(token: str = Depends(verify_token)):
+    """SSE endpoint for live system stats — requires Bearer token."""
+    async def event_stream():
+        while True:
+            r1 = run_command("uptime")
+            r2 = run_command("df -h / 2>/dev/null | tail -1")
+            r3 = run_command("free -h 2>/dev/null | head -2 || echo 'free not available'")
+            stats = {
+                "timestamp": datetime.now().isoformat(),
+                "uptime": r1["stdout"].strip(),
+                "disk": r2["stdout"].strip(),
+                "memory": r3["stdout"].strip(),
+            }
+            yield f"data: {json.dumps(stats)}\n\n"
+            await asyncio.sleep(5)
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+@app.get("/api/docs")
+async def api_docs(token: str = Depends(verify_token)):
+    """API documentation — requires Bearer token."""
+    return {
+        "version": "2.1",
+        "endpoints": {
+            "GET /health": "Health check (no auth)",
+            "GET /terminal": "Web terminal UI (no auth)",
+            "GET /api/bootstrap": "Token discovery (first-time, if enabled)",
+            "POST /api/exec": "Execute command (Bearer token) — body: {cmd, timeout, cwd}",
+            "GET /api/diagnostics": "System diagnostics (Bearer token)",
+            "GET /api/tokens": "Token discovery from env (Bearer token)",
+            "GET /api/env": "Environment info, masked (Bearer token)",
+            "GET /api/files": "List files (Bearer token) — query: ?path=/dir",
+            "GET /api/files/read": "Read file (Bearer token) — query: ?path=/file",
+            "POST /api/files/write": "Write file (Bearer token) — body: {path, content}",
+            "GET /api/exec/history": "Command history (Bearer token)",
+            "POST /api/exec/history/clear": "Clear history (Bearer token)",
+            "GET /api/processes": "Top processes (Bearer token)",
+            "GET /api/monitor/stream": "SSE system stats (Bearer token)",
+            "GET /api/sshx": "Get sshx link (Bearer token)",
+            "POST /api/install/sshx": "Install sshx (Bearer token)",
+        },
+    }
+
+
+# ─── Main ───────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    PORT = int(os.environ.get("PORT", "7860"))
-    HOST = os.environ.get("HOST", "0.0.0.0")
+    import shutil
 
-    print(f"Starting agent-node v2.1 (Gradio) on {HOST}:{PORT}")
+    print(f"Starting agent-node v2.1 (FastAPI) on {HOST}:{PORT}")
     print(f"Token: {TOKEN[:8]}...{TOKEN[-4:]}")
-    print(f"Platform: {', '.join(_detect_platform())}")
+    print(f"Platform: {', '.join(detect_platform())}")
     print(f"Tools: ssh={bool(shutil.which('ssh'))} curl={bool(shutil.which('curl'))} bash={bool(shutil.which('bash'))}")
+    print(f"Bootstrap: {BOOTSTRAP_ENABLED}")
 
-    demo.queue()
-    demo.launch(
-        server_name=HOST,
-        server_port=PORT,
-        share=False,
-        favicon_path=None,
-        theme=gr.themes.Default(
-            primary_hue="green",
-            secondary_hue="blue",
-        ),
-        css="""
-        .terminal-output { font-family: 'Courier New', monospace; font-size: 14px; }
-        body { background-color: #0f0f23; }
-        .gradio-container { background-color: #0f0f23; }
-        """,
+    import uvicorn
+    uvicorn.run(
+        "app:app",
+        host=HOST,
+        port=PORT,
+        log_level="info",
     )
