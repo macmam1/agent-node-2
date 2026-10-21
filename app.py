@@ -242,15 +242,6 @@ def get_history():
 # ─── Build Gradio Interface ─────────────────────────────────────────
 with gr.Blocks(
     title="🤖 agent-node v2.1",
-    theme=gr.themes.Default(
-        primary_hue="green",
-        secondary_hue="blue",
-    ),
-    css="""
-    .terminal-output { font-family: 'Courier New', monospace; font-size: 14px; }
-    body { background-color: #0f0f23; }
-    .gradio-container { background-color: #0f0f23; }
-    """
 ) as demo:
 
     with gr.Row():
@@ -397,5 +388,13 @@ if __name__ == "__main__":
         server_port=PORT,
         share=False,
         favicon_path=None,
-        analytics_enabled=False,
+        theme=gr.themes.Default(
+            primary_hue="green",
+            secondary_hue="blue",
+        ),
+        css="""
+        .terminal-output { font-family: 'Courier New', monospace; font-size: 14px; }
+        body { background-color: #0f0f23; }
+        .gradio-container { background-color: #0f0f23; }
+        """,
     )
